@@ -1,0 +1,1 @@
+# esp32-s3-cam_devkit1c
