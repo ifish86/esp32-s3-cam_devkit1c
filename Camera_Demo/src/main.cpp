@@ -6,17 +6,25 @@
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 #include "credentials.h"  // WiFi credentials
+#include "FS.h"
+#include "SD_MMC.h"
 
 WebServer server(80);
 
-constexpr int LED_PIN = 48;
+constexpr int LED_PIN = 48;  // Built-in LED, can't be moved
 constexpr int LED_COUNT = 1;
 Adafruit_NeoPixel statusLed(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 bool cameraPsramDetected = false;
+bool sdCardDetected = false;
 bool isCapturing = false;
 bool isServingWeb = false;  // Flag to prevent camera access during web serving
 bool tftEnabled = true;      // Flag to enable/disable TFT display (set to true if display is connected)
+
+// SD card photo tracking
+int photoCount = 0;
+uint64_t sdCardTotal = 0;
+uint64_t sdCardUsed = 0;
 
 // Persistent image storage
 uint8_t* storedImageBuffer = nullptr;
@@ -46,13 +54,16 @@ const uint32_t CAPTURE_COOLDOWN_MS = 3000;  // 3 seconds
 #define HREF_GPIO_NUM     7
 #define PCLK_GPIO_NUM     13
 
-// TFT Display (ILI9341) pins - safe from PSRAM conflict (GPIO 26-37)
-#define TFT_MOSI_GPIO_NUM  38
-#define TFT_SCLK_GPIO_NUM  39
-#define TFT_CS_GPIO_NUM    40
-#define TFT_DC_GPIO_NUM    41
-#define TFT_RST_GPIO_NUM   42
-#define TFT_BL_GPIO_NUM    45
+// TFT Display (ILI9341) pins - moved to avoid SD card (38-43)
+#define TFT_MOSI_GPIO_NUM  19
+#define TFT_SCLK_GPIO_NUM  20
+#define TFT_CS_GPIO_NUM    21
+#define TFT_DC_GPIO_NUM    14
+#define TFT_RST_GPIO_NUM   45
+#define TFT_BL_GPIO_NUM    3   // TFT backlight on GPIO 3
+
+// SD Card uses SD_MMC interface (built-in slot on Freenove board)
+// Pins: CLK=39, CMD=38, D0=40, D1=41, D2=42, D3=43 (fixed by board)
 
 // Shutter Button
 #define SHUTTER_BUTTON_GPIO_NUM 47
@@ -66,10 +77,10 @@ public:
   LGFX(void) {
     {
       auto cfg = _bus_instance.config();
-      cfg.spi_host = SPI2_HOST;
+      cfg.spi_host = SPI3_HOST;  // Changed from SPI2_HOST to avoid conflicts
       cfg.spi_mode = 0;
-      cfg.freq_write = 40000000;
-      cfg.freq_read = 16000000;
+      cfg.freq_write = 20000000;  // Reduced from 40MHz to 20MHz for stability
+      cfg.freq_read = 10000000;   // Reduced from 16MHz to 10MHz
       cfg.spi_3wire = false;
       cfg.use_lock = true;
       cfg.dma_channel = SPI_DMA_CH_AUTO;
@@ -97,7 +108,7 @@ public:
       cfg.invert = false;
       cfg.rgb_order = false;
       cfg.dlen_16bit = false;
-      cfg.bus_shared = false;
+      cfg.bus_shared = true;  // Changed to true - bus shared with other devices
       _panel_instance.config(cfg);
     }
 
@@ -119,16 +130,36 @@ void initDisplay() {
   }
   
   Serial.println("[Display] Initializing TFT with LovyanGFX...");
+  Serial.printf("[Display] Pins: MOSI=%d, SCLK=%d, CS=%d, DC=%d, RST=%d, BL=%d\n",
+                TFT_MOSI_GPIO_NUM, TFT_SCLK_GPIO_NUM, TFT_CS_GPIO_NUM, 
+                TFT_DC_GPIO_NUM, TFT_RST_GPIO_NUM, TFT_BL_GPIO_NUM);
   
+  // Hardware reset before init
+  pinMode(TFT_RST_GPIO_NUM, OUTPUT);
+  digitalWrite(TFT_RST_GPIO_NUM, LOW);
+  delay(100);
+  digitalWrite(TFT_RST_GPIO_NUM, HIGH);
+  delay(200);
+  
+  Serial.println("[Display] Starting LovyanGFX init...");
   lcd.init();
+  Serial.println("[Display] Init complete, setting rotation...");
   lcd.setRotation(1);  // Landscape mode (320x240)
+  
+  Serial.println("[Display] Attempting to fill screen red...");
+  lcd.fillScreen(TFT_RED);    // Try red to see if it's working
+  delay(1000);
+  
+  Serial.println("[Display] Filling screen black...");
   lcd.fillScreen(TFT_BLACK);
   
   // Turn on backlight
   pinMode(TFT_BL_GPIO_NUM, OUTPUT);
   digitalWrite(TFT_BL_GPIO_NUM, HIGH);
+  Serial.println("[Display] Backlight enabled");
   
   // Display startup message
+  Serial.println("[Display] Drawing text...");
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextSize(2);
   lcd.setCursor(10, 10);
@@ -168,12 +199,18 @@ void displayCameraInfo() {
   
   lcd.setTextColor(TFT_WHITE);
   lcd.setCursor(10, 60);
+  lcd.print("SD Card: ");
+  lcd.setTextColor(sdCardDetected ? TFT_GREEN : TFT_RED);
+  lcd.println(sdCardDetected ? "Ready" : "Not Found");
+  
+  lcd.setTextColor(TFT_WHITE);
+  lcd.setCursor(10, 75);
   lcd.print("WiFi: ");
   if (WiFi.status() == WL_CONNECTED) {
     lcd.setTextColor(TFT_GREEN);
     lcd.println("Connected");
     lcd.setTextColor(TFT_WHITE);
-    lcd.setCursor(10, 75);
+    lcd.setCursor(10, 90);
     lcd.print("IP: ");
     lcd.println(WiFi.localIP().toString());
   } else {
@@ -182,9 +219,9 @@ void displayCameraInfo() {
   }
   
   lcd.setTextColor(TFT_WHITE);
-  lcd.setCursor(10, 100);
-  lcd.println("Stream: /stream");
   lcd.setCursor(10, 115);
+  lcd.println("Stream: /stream");
+  lcd.setCursor(10, 130);
   lcd.println("Snapshot: /jpg");
 }
 
@@ -208,6 +245,120 @@ void displayCameraFrame() {
   esp_camera_fb_return(fb);
 }
 
+bool initSDCard() {
+  Serial.println("[SD] Initializing SD_MMC card (built-in slot)...");
+  
+  // Configure SD_MMC pins explicitly for Freenove ESP32-S3
+  SD_MMC.setPins(39, 38, 40, 41, 42, 43);  // CLK, CMD, D0, D1, D2, D3
+  Serial.println("[SD] Pins configured: CLK=39, CMD=38, D0=40, D1=41, D2=42, D3=43");
+  
+  // Try 1-bit mode first (more compatible, uses only CLK, CMD, D0)
+  if (!SD_MMC.begin("/sdcard", true)) {
+    Serial.println("[SD] 1-bit mode failed, trying 4-bit mode...");
+    // Try 4-bit mode (uses all 6 pins)
+    if (!SD_MMC.begin("/sdcard", false)) {
+      Serial.println("[SD] Card Mount Failed");
+      Serial.println("[SD] Check: 1) SD card inserted 2) Card formatted");
+      return false;
+    }
+  }
+  
+  uint8_t cardType = SD_MMC.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("[SD] No SD card attached");
+    return false;
+  }
+  
+  Serial.print("[SD] Card Type: ");
+  if (cardType == CARD_MMC) {
+    Serial.println("MMC");
+  } else if (cardType == CARD_SD) {
+    Serial.println("SDSC");
+  } else if (cardType == CARD_SDHC) {
+    Serial.println("SDHC");
+  } else {
+    Serial.println("UNKNOWN");
+  }
+  
+  uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
+  Serial.printf("[SD] Card Size: %lluMB\n", cardSize);
+  
+  // Count existing photos
+  photoCount = 0;
+  File root = SD_MMC.open("/");
+  if (root) {
+    File file = root.openNextFile();
+    while (file) {
+      String filename = String(file.name());
+      // Remove leading slash if present
+      if (filename.startsWith("/")) {
+        filename = filename.substring(1);
+      }
+      if (filename.startsWith("photo") && filename.endsWith(".jpg")) {
+        photoCount++;
+        Serial.printf("[SD] Found: %s\n", filename.c_str());
+      }
+      file = root.openNextFile();
+    }
+    root.close();
+  }
+  
+  Serial.printf("[SD] Found %d existing photos\n", photoCount);
+  
+  return true;
+}
+
+void updateSDCardStats() {
+  if (!sdCardDetected) return;
+  
+  sdCardTotal = SD_MMC.totalBytes();
+  sdCardUsed = SD_MMC.usedBytes();
+}
+
+int getNextPhotoNumber() {
+  if (!sdCardDetected) return -1;
+  
+  // Find the next available photo number
+  int photoNum = 1;
+  char filename[32];
+  
+  while (photoNum < 10000) {  // Limit to photo9999.jpg
+    snprintf(filename, sizeof(filename), "/photo%03d.jpg", photoNum);
+    if (!SD_MMC.exists(filename)) {
+      return photoNum;
+    }
+    photoNum++;
+  }
+  
+  return -1;  // No available slots
+}
+
+void displayPhotoOverlay() {
+  if (!tftEnabled || !sdCardDetected) return;
+  
+  updateSDCardStats();
+  
+  // Calculate storage percentage
+  float storagePercent = 0;
+  if (sdCardTotal > 0) {
+    storagePercent = (sdCardUsed * 100.0) / sdCardTotal;
+  }
+  
+  // Draw semi-transparent overlay at bottom of screen
+  lcd.fillRect(0, 220, 320, 20, TFT_BLACK);
+  
+  lcd.setTextColor(TFT_YELLOW);
+  lcd.setTextSize(1);
+  
+  // Photo count on the left
+  lcd.setCursor(5, 225);
+  lcd.printf("Photos: %d", photoCount);
+  
+  // Storage on the right
+  lcd.setCursor(180, 225);
+  lcd.printf("SD: %.1f%%", storagePercent);
+}
+
 bool captureHighResStill() {
   Serial.println("[Camera] Capturing high-res still...");
   
@@ -222,9 +373,9 @@ bool captureHighResStill() {
   esp_camera_return_all();
   delay(100);
   
-  // Change to high resolution (1600x1200 = UXGA)
-  Serial.println("[Camera] Switching to UXGA (1600x1200)...");
-  sensor->set_framesize(sensor, FRAMESIZE_UXGA);
+  // Change to high resolution (1024x768 = XGA)
+  Serial.println("[Camera] Switching to XGA (1024x768)...");
+  sensor->set_framesize(sensor, FRAMESIZE_XGA);
   
   // Also adjust JPEG quality for high-res capture (lower number = higher quality)
   sensor->set_quality(sensor, 10);
@@ -260,13 +411,36 @@ bool captureHighResStill() {
   Serial.printf("[Camera] Captured %dx%d image (%d bytes)\n", 
                 fb->width, fb->height, fb->len);
   
-  // Free previous stored image if it exists
+  bool savedToSD = false;
+  char filename[32] = "N/A";
+  
+  // Save to SD card if available
+  if (sdCardDetected) {
+    int photoNum = getNextPhotoNumber();
+    if (photoNum > 0) {
+      snprintf(filename, sizeof(filename), "/photo%03d.jpg", photoNum);
+      
+      File file = SD_MMC.open(filename, FILE_WRITE);
+      if (file) {
+        file.write(fb->buf, fb->len);
+        file.close();
+        photoCount++;
+        savedToSD = true;
+        Serial.printf("[SD] Saved to %s\n", filename);
+      } else {
+        Serial.printf("[SD] Failed to open %s for writing\n", filename);
+      }
+    } else {
+      Serial.println("[SD] No available photo slots (reached photo9999.jpg)");
+    }
+  }
+  
+  // Also keep a copy in PSRAM for web serving (last captured image)
   if (storedImageBuffer != nullptr) {
     free(storedImageBuffer);
     storedImageBuffer = nullptr;
   }
   
-  // Allocate memory in PSRAM for persistent storage
   storedImageSize = fb->len;
   if (psramFound()) {
     storedImageBuffer = (uint8_t*)ps_malloc(storedImageSize);
@@ -275,7 +449,6 @@ bool captureHighResStill() {
   }
   
   if (storedImageBuffer != nullptr) {
-    // Copy image data to persistent storage
     memcpy(storedImageBuffer, fb->buf, storedImageSize);
     
     // Store timestamp
@@ -286,28 +459,39 @@ bool captureHighResStill() {
     snprintf(captureTimestamp, sizeof(captureTimestamp), 
              "Uptime: %02lu:%02lu:%02lu", hours, minutes, seconds);
     
-    Serial.printf("[Camera] Image saved to %s - %s\n", 
+    Serial.printf("[Camera] Copy saved to %s for web - %s\n", 
                   psramFound() ? "PSRAM" : "DRAM", captureTimestamp);
-  } else {
-    Serial.println("[Camera] Failed to allocate memory for image storage!");
-  }
-  
-  // Show captured image info on display
-  if (tftEnabled) {
-    lcd.fillScreen(TFT_BLACK);
-    lcd.setTextColor(TFT_GREEN);
-    lcd.setTextSize(2);
-    lcd.setCursor(10, 10);
-    lcd.println("Image Captured!");
-    lcd.setTextSize(1);
-    lcd.setCursor(10, 40);
-    lcd.printf("%dx%d - %d KB", fb->width, fb->height, fb->len / 1024);
-    lcd.setCursor(10, 55);
-    lcd.println(captureTimestamp);
   }
   
   // Return the frame buffer
   esp_camera_fb_return(fb);
+  
+  // Show captured image on display for 1 second (using the stored copy)
+  if (tftEnabled && storedImageBuffer != nullptr) {
+    lcd.fillScreen(TFT_BLACK);
+    
+    // XGA is 1024x768, need to scale to fit 320x240 display
+    // Scale factor: 320/1024 = 0.3125, 240/768 = 0.3125 (perfect 4:3 match)
+    // Use drawJpg with explicit width/height constraint
+    float scale_x = 320.0f / 1024.0f;
+    float scale_y = 240.0f / 768.0f;
+    float scale = (scale_x < scale_y) ? scale_x : scale_y;  // Use smaller scale to fit
+    
+    int scaled_width = (int)(1024 * scale);
+    int scaled_height = (int)(768 * scale);
+    int offset_x = (320 - scaled_width) / 2;
+    int offset_y = (240 - scaled_height) / 2;
+    
+    Serial.printf("[Display] Scaling XGA to %dx%d at offset (%d,%d)\n", 
+                  scaled_width, scaled_height, offset_x, offset_y);
+    
+    // Set clip rectangle to constrain drawing, then draw centered
+    lcd.setClipRect(0, 0, 320, 240);
+    lcd.drawJpg(storedImageBuffer, storedImageSize, offset_x, offset_y, scaled_width, scaled_height);
+    
+    Serial.println("[Display] Showing captured image for 1 second");
+    delay(1000);
+  }
   
   // Restore to normal resolution and quality for preview
   Serial.println("[Camera] Restoring to preview mode...");
@@ -317,9 +501,6 @@ bool captureHighResStill() {
   delay(200);
   
   Serial.println("[Camera] Restored to preview resolution");
-  
-  // Show confirmation for 2 seconds
-  delay(2000);
   
   return true;
 }
@@ -382,9 +563,9 @@ bool initCamera() {
   Serial.printf("[Camera] PSRAM found: %s\n", hasPsram ? "yes" : "no");
 
   if (hasPsram) {
-    // Initialize with UXGA to allocate large enough buffers
+    // Initialize with XGA to allocate large enough buffers
     // We'll switch to QVGA after init for preview
-    config.frame_size = FRAMESIZE_UXGA;  // 1600x1200 - buffers sized for max resolution
+    config.frame_size = FRAMESIZE_XGA;  // 1024x768 - buffers sized for max resolution
     config.jpeg_quality = 10;
     config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -416,15 +597,15 @@ bool initCamera() {
   if (sensor != nullptr) {
     sensor->set_vflip(sensor, 1);
     
-    // If we initialized with UXGA for large buffers, switch to QVGA for preview
-    if (hasPsram && config.frame_size == FRAMESIZE_UXGA) {
+    // If we initialized with XGA for large buffers, switch to QVGA for preview
+    if (hasPsram && config.frame_size == FRAMESIZE_XGA) {
       Serial.println("[Camera] Switching to QVGA for preview mode...");
       sensor->set_framesize(sensor, FRAMESIZE_QVGA);
       sensor->set_quality(sensor, 12);
       delay(200);
       // Clear any buffered frames
       esp_camera_return_all();
-      Serial.println("[Camera] Preview mode ready (buffers sized for UXGA)");
+      Serial.println("[Camera] Preview mode ready (buffers sized for XGA)");
     }
   }
 
@@ -563,6 +744,22 @@ void setup() {
   updateDisplay("Camera OK!", TFT_GREEN);
   delay(500);
 
+  // Initialize SD Card
+  updateDisplay("Initializing SD...", TFT_YELLOW);
+  sdCardDetected = initSDCard();
+  if (sdCardDetected) {
+    updateDisplay("SD Card OK!", TFT_GREEN);
+  } else {
+    updateDisplay("SD Card Failed!", TFT_RED);
+  }
+  delay(500);
+
+  // TEMPORARY: Disable WiFi to test if it's interfering with TFT
+  Serial.println("[WiFi] WiFi temporarily disabled for TFT testing");
+  updateDisplay("WiFi DISABLED (testing)", TFT_YELLOW);
+  delay(3000);
+  
+  /*
   updateDisplay("Connecting WiFi...", TFT_YELLOW);
   connectToWifi();
 
@@ -578,6 +775,7 @@ void setup() {
   // Display full camera info on TFT
   displayCameraInfo();
   delay(2000);
+  */
   
   // Setup shutter button with internal pullup
   pinMode(SHUTTER_BUTTON_GPIO_NUM, INPUT_PULLUP);
@@ -588,6 +786,7 @@ void setup() {
     lcd.fillScreen(TFT_BLACK);
   }
 
+  /*
   server.on("/", HTTP_GET, handleRoot);
   server.on("/jpg", HTTP_GET, handleJpg);
   server.on("/captured.jpg", HTTP_GET, handleJpg);  // Alias for captured image
@@ -597,10 +796,13 @@ void setup() {
   Serial.println("[Web] Server started");
   Serial.print("[Web] Open in browser: http://");
   Serial.println(WiFi.localIP());
+  */
+  
+  Serial.println("[Boot] Setup complete - TFT test mode (WiFi/Web disabled)");
 }
 
 void loop() {
-  server.handleClient();
+  // server.handleClient();  // Disabled for TFT testing
   
   // Check for button press (active LOW with pullup)
   static bool lastButtonState = HIGH;
@@ -618,7 +820,7 @@ void loop() {
     // Turn LED white
     setStatusLed(255, 255, 255);
     
-    // Capture high-res still and save to PSRAM
+    // Capture high-res still and save to SD card
     captureHighResStill();
     
     // Restore LED to normal color
@@ -637,6 +839,7 @@ void loop() {
   // Continuously display camera preview (only if TFT is enabled and not busy)
   if (tftEnabled && !isCapturing && !isServingWeb) {
     displayCameraFrame();
+    displayPhotoOverlay();  // Show photo count and SD card usage
   } else {
     delay(10);  // Small delay when not displaying
   }
