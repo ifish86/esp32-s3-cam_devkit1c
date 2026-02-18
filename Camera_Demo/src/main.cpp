@@ -5,9 +5,7 @@
 #include "esp_camera.h"
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
-
-const char* WIFI_SSID = "wifi_ssid";
-const char* WIFI_PASSWORD = "wifi_password";
+#include "credentials.h"  // WiFi credentials
 
 WebServer server(80);
 
