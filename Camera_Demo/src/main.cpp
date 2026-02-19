@@ -20,6 +20,8 @@ bool sdCardDetected = false;
 bool isCapturing = false;
 bool isServingWeb = false;  // Flag to prevent camera access during web serving
 bool tftEnabled = true;      // Flag to enable/disable TFT display (set to true if display is connected)
+bool tftPreviewEnabled = true;  // Enable continuous camera preview on TFT
+bool audioEnabled = false;  // Track if audio PWM is initialized
 
 // SD card photo tracking
 int photoCount = 0;
@@ -67,6 +69,12 @@ const uint32_t CAPTURE_COOLDOWN_MS = 3000;  // 3 seconds
 
 // Shutter Button
 #define SHUTTER_BUTTON_GPIO_NUM 47
+
+// Audio buzzer pin (PWM-based beep)
+#define BUZZER_GPIO_NUM    35
+#define BUZZER_CHANNEL     0
+#define BUZZER_FREQ        1000  // 1kHz beep
+#define BUZZER_RESOLUTION  8
 
 // LovyanGFX configuration for ILI9341
 class LGFX : public lgfx::LGFX_Device {
@@ -121,6 +129,28 @@ static LGFX lcd;
 void setStatusLed(uint8_t red, uint8_t green, uint8_t blue) {
   statusLed.setPixelColor(0, statusLed.Color(red, green, blue));
   statusLed.show();
+}
+
+void initAudio() {
+  Serial.println("[Audio] Initializing PWM buzzer...");
+  
+  // Configure LEDC for PWM audio output
+  ledcSetup(BUZZER_CHANNEL, BUZZER_FREQ, BUZZER_RESOLUTION);
+  ledcAttachPin(BUZZER_GPIO_NUM, BUZZER_CHANNEL);
+  ledcWrite(BUZZER_CHANNEL, 0);  // Start silent
+  
+  audioEnabled = true;
+  Serial.printf("[Audio] PWM buzzer initialized on GPIO %d\n", BUZZER_GPIO_NUM);
+}
+
+void playClickSound() {
+  // Play a short beep (shutter click sound) - only if audio is enabled
+  if (!audioEnabled) return;
+  
+  ledcWriteTone(BUZZER_CHANNEL, BUZZER_FREQ);
+  ledcWrite(BUZZER_CHANNEL, 128);  // 50% duty cycle
+  delay(50);  // 50ms beep
+  ledcWrite(BUZZER_CHANNEL, 0);    // Silence
 }
 
 void initDisplay() {
@@ -369,32 +399,36 @@ bool captureHighResStill() {
     return false;
   }
   
-  // Return all frame buffers before changing resolution
+  // CRITICAL: Pause ALL camera access to avoid DMA conflicts
+  bool wasPreviewing = tftPreviewEnabled;
+  tftPreviewEnabled = false;
+  isServingWeb = true;  // Block web server camera access too
+  delay(500);  // Give extra time for any pending operations to complete
+  
+  // Return all frame buffers and wait
   esp_camera_return_all();
-  delay(100);
+  delay(300);
   
-  // Change to high resolution (1024x768 = XGA)
-  Serial.println("[Camera] Switching to XGA (1024x768)...");
-  sensor->set_framesize(sensor, FRAMESIZE_XGA);
+  // Switch to high resolution (1600x1200 = UXGA)
+  Serial.println("[Camera] Switching to UXGA (1600x1200)...");
+  sensor->set_framesize(sensor, FRAMESIZE_UXGA);
+  sensor->set_quality(sensor, 12);  // Slightly higher quality number = less compression = less memory stress
+  delay(800);  // UXGA needs more time to stabilize
   
-  // Also adjust JPEG quality for high-res capture (lower number = higher quality)
-  sensor->set_quality(sensor, 10);
-  
-  delay(500);  // Give more time for sensor to adjust
-  
-  // Grab and discard 3 frames to let sensor stabilize at new resolution
-  Serial.println("[Camera] Warming up sensor...");
-  for (int i = 0; i < 3; i++) {
+  // More warmup frames to ensure sensor is fully stable at UXGA
+  Serial.println("[Camera] Warming up sensor (UXGA requires more warmup)...");
+  for (int i = 0; i < 8; i++) {
     camera_fb_t* tempFb = esp_camera_fb_get();
     if (tempFb) {
       Serial.printf("[Camera] Warmup frame %d: %dx%d (%d bytes)\n", 
                     i+1, tempFb->width, tempFb->height, tempFb->len);
       esp_camera_fb_return(tempFb);
-    } else {
-      Serial.printf("[Camera] Warmup frame %d failed\n", i+1);
     }
-    delay(100);
+    delay(200);  // Longer delay between warmup frames for UXGA
   }
+  
+  // Extra delay before final capture to ensure sensor is fully stable
+  delay(400);
   
   // Now capture the actual high-res frame
   Serial.println("[Camera] Capturing final frame...");
@@ -405,6 +439,8 @@ bool captureHighResStill() {
     sensor->set_framesize(sensor, FRAMESIZE_QVGA);
     sensor->set_quality(sensor, 12);
     esp_camera_return_all();
+    tftPreviewEnabled = wasPreviewing;  // Restore TFT preview
+    isServingWeb = false;  // Restore web server access
     return false;
   }
   
@@ -470,37 +506,24 @@ bool captureHighResStill() {
   if (tftEnabled && storedImageBuffer != nullptr) {
     lcd.fillScreen(TFT_BLACK);
     
-    // XGA is 1024x768, need to scale to fit 320x240 display
-    // Scale factor: 320/1024 = 0.3125, 240/768 = 0.3125 (perfect 4:3 match)
-    // Use drawJpg with explicit width/height constraint
-    float scale_x = 320.0f / 1024.0f;
-    float scale_y = 240.0f / 768.0f;
-    float scale = (scale_x < scale_y) ? scale_x : scale_y;  // Use smaller scale to fit
-    
-    int scaled_width = (int)(1024 * scale);
-    int scaled_height = (int)(768 * scale);
-    int offset_x = (320 - scaled_width) / 2;
-    int offset_y = (240 - scaled_height) / 2;
-    
-    Serial.printf("[Display] Scaling XGA to %dx%d at offset (%d,%d)\n", 
-                  scaled_width, scaled_height, offset_x, offset_y);
-    
-    // Set clip rectangle to constrain drawing, then draw centered
-    lcd.setClipRect(0, 0, 320, 240);
-    lcd.drawJpg(storedImageBuffer, storedImageSize, offset_x, offset_y, scaled_width, scaled_height);
+    // Draw captured image - will scale automatically to fit display
+    lcd.drawJpg(storedImageBuffer, storedImageSize, 0, 0, 320, 240);
     
     Serial.println("[Display] Showing captured image for 1 second");
     delay(1000);
   }
   
-  // Restore to normal resolution and quality for preview
+  // Restore to normal resolution and quality
   Serial.println("[Camera] Restoring to preview mode...");
   sensor->set_framesize(sensor, FRAMESIZE_QVGA);
   sensor->set_quality(sensor, 12);
   esp_camera_return_all();
   delay(200);
-  
   Serial.println("[Camera] Restored to preview resolution");
+  
+  // Re-enable TFT preview and web server camera access
+  tftPreviewEnabled = wasPreviewing;
+  isServingWeb = false;
   
   return true;
 }
@@ -563,9 +586,9 @@ bool initCamera() {
   Serial.printf("[Camera] PSRAM found: %s\n", hasPsram ? "yes" : "no");
 
   if (hasPsram) {
-    // Initialize with XGA to allocate large enough buffers
+    // Initialize with UXGA to allocate large enough buffers
     // We'll switch to QVGA after init for preview
-    config.frame_size = FRAMESIZE_XGA;  // 1024x768 - buffers sized for max resolution
+    config.frame_size = FRAMESIZE_UXGA;  // 1600x1200 - buffers sized for max resolution
     config.jpeg_quality = 10;
     config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -597,15 +620,15 @@ bool initCamera() {
   if (sensor != nullptr) {
     sensor->set_vflip(sensor, 1);
     
-    // If we initialized with XGA for large buffers, switch to QVGA for preview
-    if (hasPsram && config.frame_size == FRAMESIZE_XGA) {
+    // If we initialized with UXGA for large buffers, switch to QVGA for preview
+    if (hasPsram && config.frame_size == FRAMESIZE_UXGA) {
       Serial.println("[Camera] Switching to QVGA for preview mode...");
       sensor->set_framesize(sensor, FRAMESIZE_QVGA);
       sensor->set_quality(sensor, 12);
       delay(200);
       // Clear any buffered frames
       esp_camera_return_all();
-      Serial.println("[Camera] Preview mode ready (buffers sized for XGA)");
+      Serial.println("[Camera] Preview mode ready (buffers sized for UXGA)");
     }
   }
 
@@ -754,12 +777,7 @@ void setup() {
   }
   delay(500);
 
-  // TEMPORARY: Disable WiFi to test if it's interfering with TFT
-  Serial.println("[WiFi] WiFi temporarily disabled for TFT testing");
-  updateDisplay("WiFi DISABLED (testing)", TFT_YELLOW);
-  delay(3000);
-  
-  /*
+  // Connect to WiFi
   updateDisplay("Connecting WiFi...", TFT_YELLOW);
   connectToWifi();
 
@@ -775,18 +793,23 @@ void setup() {
   // Display full camera info on TFT
   displayCameraInfo();
   delay(2000);
-  */
   
   // Setup shutter button with internal pullup
   pinMode(SHUTTER_BUTTON_GPIO_NUM, INPUT_PULLUP);
   Serial.println("[Button] Shutter button configured on GPIO 47");
+  
+  // Initialize PWM audio for shutter click sound (disabled when WiFi active to avoid conflicts)
+  if (WiFi.status() != WL_CONNECTED) {
+    initAudio();
+  } else {
+    Serial.println("[Audio] Audio disabled - WiFi active");
+  }
   
   // Clear display for camera preview
   if (tftEnabled) {
     lcd.fillScreen(TFT_BLACK);
   }
 
-  /*
   server.on("/", HTTP_GET, handleRoot);
   server.on("/jpg", HTTP_GET, handleJpg);
   server.on("/captured.jpg", HTTP_GET, handleJpg);  // Alias for captured image
@@ -796,13 +819,42 @@ void setup() {
   Serial.println("[Web] Server started");
   Serial.print("[Web] Open in browser: http://");
   Serial.println(WiFi.localIP());
-  */
   
-  Serial.println("[Boot] Setup complete - TFT test mode (WiFi/Web disabled)");
+  // Display WiFi info and instructions on TFT
+  if (tftEnabled) {
+    lcd.fillScreen(TFT_BLACK);
+    lcd.setTextSize(2);
+    lcd.setTextColor(TFT_GREEN);
+    lcd.setCursor(10, 40);
+    lcd.println("Web Server Ready");
+    lcd.setTextSize(1);
+    lcd.setTextColor(TFT_WHITE);
+    lcd.setCursor(10, 80);
+    lcd.print("IP: ");
+    lcd.println(WiFi.localIP());
+    lcd.setCursor(10, 100);
+    lcd.println("Browse to view/stream");
+    lcd.setCursor(10, 130);
+    lcd.setTextColor(TFT_YELLOW);
+    lcd.println("Press button to capture");
+    lcd.setCursor(10, 150);
+    lcd.print("Photos: ");
+    lcd.println(photoCount);
+  }
+  
+  Serial.println("[Boot] Setup complete");
+  delay(1000);  // Give everything time to stabilize before entering loop
+  Serial.println("[Boot] Entering main loop");
 }
 
 void loop() {
-  // server.handleClient();  // Disabled for TFT testing
+  // Handle web server requests (only if not capturing)
+  if (!isCapturing) {
+    server.handleClient();
+  }
+  
+  // Small yield to prevent watchdog issues
+  yield();
   
   // Check for button press (active LOW with pullup)
   static bool lastButtonState = HIGH;
@@ -816,6 +868,9 @@ void loop() {
     // Button pressed and cooldown expired - capture high-res image
     isCapturing = true;
     lastCaptureTime = currentTime;
+    
+    // Play shutter click sound
+    playClickSound();
     
     // Turn LED white
     setStatusLed(255, 255, 255);
@@ -836,8 +891,9 @@ void loop() {
   
   lastButtonState = buttonState;
   
-  // Continuously display camera preview (only if TFT is enabled and not busy)
-  if (tftEnabled && !isCapturing && !isServingWeb) {
+  // Continuously display camera preview (only if preview is enabled and not busy)
+  // When WiFi is enabled, preview is disabled to avoid camera access conflicts
+  if (tftPreviewEnabled && !isCapturing && !isServingWeb) {
     displayCameraFrame();
     displayPhotoOverlay();  // Show photo count and SD card usage
   } else {
